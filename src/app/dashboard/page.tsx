@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef, useCallback, Suspense } from "react";
+import React, { useState, useEffect, useRef, useCallback, Suspense } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { motion, AnimatePresence, useSpring, useTransform } from "framer-motion";
@@ -145,12 +145,18 @@ function DashboardContent() {
   const fee = Math.ceil(Number(payAmount || 0) * 0.035);
   const total = Number(payAmount || 0) + fee;
 
-  const ACTIONS = [
+  const ACTIONS: Array<{
+    label: string;
+    icon: React.ElementType;
+    color: string;
+    href?: string;
+    onClick?: () => void;
+  }> = [
     { label: "スキャン", icon: QrCode, color: "default", href: "/scan" },
     { label: "送金", icon: Send, color: "blue", onClick: () => {} },
     { label: "受取", icon: Download, color: "purple", onClick: () => setActiveSheet("pay") },
     { label: "履歴", icon: History, color: "slate", onClick: () => {} },
-  ] as const;
+  ];
 
   return (
     <div
