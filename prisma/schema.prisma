@@ -1,0 +1,198 @@
+// ============================================================================
+// クリプトペイ — データベーススキーマ
+//
+// 法的位置づけ:
+//   本サービスは「暗号資産交換業」ではなく「決済代行サービス」として設計。
+//   加盟店はシステム利用料（手数料）を事前にデポジットし、
+//   購入者から受け取った売上金（法定通貨換算）を出金する仕組み。
+//   手数料はデポジットから充当され、暗号資産の売買差益を収益源としない。
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// 加盟店
+// ---------------------------------------------------------------------------
+model Merchant {
+  id               String   @id @default(uuid()) @db.Uuid
+  supabaseUserId   String   @unique @map("supabase_user_id")
+  name             String
+  email            String   @unique
+  fiatCurrency     String   @default("JPY") @map("fiat_currency") @db.VarChar(3)
+
+  /// 手数料デポジット残高（法定通貨単位）。
+  /// 出金時にシステム利用料を充当するための事前預り金。
+  /// 「暗号資産の売買」ではなく「サービス利用料の預り」である点に留意。
+  depositBalance   Decimal  @default(0) @map("deposit_balance") @db.Decimal(18, 2)
+
+  /// 売上残高（法定通貨単位）。決済完了時に加算、出金完了時に減算。
+  salesBalance     Decimal  @default(0) @map("sales_balance") @db.Decimal(18, 2)
+
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  transactions     Transaction[]
+  depositLedger    DepositLedger[]
+  payoutRequests   PayoutRequest[]
+
+  @@map("merchants")
+}
+
+// ---------------------------------------------------------------------------
+// 決済トランザクション
+// ---------------------------------------------------------------------------
+
+enum TransactionStatus {
+  PENDING
+  WAITING
+  CONFIRMING
+  FINISHED
+  PARTIALLY_PAID
+  FAILED
+  EXPIRED
+  REFUNDED
+}
+
+model Transaction {
+  id                      String            @id @default(uuid()) @db.Uuid
+  merchantId              String            @map("merchant_id") @db.Uuid
+  merchant                Merchant          @relation(fields: [merchantId], references: [id])
+
+  /// 加盟店側の注文識別子（冪等キーとして利用）
+  orderId                 String?           @map("order_id")
+
+  /// NOWPayments 側の決済ID（API レスポンスから取得）
+  nowpaymentsPaymentId    String?           @unique @map("nowpayments_payment_id")
+
+  /// 商品代金（法定通貨）— 加盟店が受け取るべき売上
+  amountFiat              Decimal           @map("amount_fiat") @db.Decimal(18, 2)
+
+  /// プラットフォーム手数料（法定通貨）— デポジットから充当
+  platformFeeFiat         Decimal           @map("platform_fee_fiat") @db.Decimal(18, 2)
+
+  /// 購入者が実際に支払う暗号資産の通貨コード（例: btc, eth）
+  payCurrency             String?           @map("pay_currency") @db.VarChar(10)
+
+  /// 購入者が支払う暗号資産額（NOWPayments 返却値）
+  payAmount               Decimal?          @map("pay_amount") @db.Decimal(28, 18)
+
+  /// 決済ステータス
+  status                  TransactionStatus @default(PENDING)
+
+  /// 決済用の送金先アドレス（NOWPayments 返却値）
+  payAddress              String?           @map("pay_address")
+
+  /// 商品・サービスの説明（任意）
+  description             String?
+
+  createdAt               DateTime          @default(now()) @map("created_at")
+  updatedAt               DateTime          @updatedAt @map("updated_at")
+  completedAt             DateTime?         @map("completed_at")
+
+  @@index([merchantId])
+  @@index([status])
+  @@map("transactions")
+}
+
+// ---------------------------------------------------------------------------
+// デポジット台帳 — 手数料デポジットの全ての増減を記録
+//
+// 法的根拠: 加盟店が「システム利用料」として事前預り金を差し入れ、
+// 出金時にそこから手数料を差し引く。暗号資産の売買ではなく、
+// SaaS 利用料の前払い・充当という位置づけ。
+// ---------------------------------------------------------------------------
+
+enum DepositLedgerType {
+  TOPUP           // 加盟店によるデポジット入金（利用料の前払い）
+  FEE_DEDUCT      // 出金時の手数料充当
+  ADJUSTMENT      // 運営による調整（返金等）
+}
+
+model DepositLedger {
+  id              String            @id @default(uuid()) @db.Uuid
+  merchantId      String            @map("merchant_id") @db.Uuid
+  merchant        Merchant          @relation(fields: [merchantId], references: [id])
+
+  /// 正の値 = 入金、負の値 = 充当（差し引き）
+  amount          Decimal           @db.Decimal(18, 2)
+  type            DepositLedgerType
+  description     String?
+
+  /// 関連するリソースID（payout_request_id 等）
+  referenceId     String?           @map("reference_id") @db.Uuid
+  referenceType   String?           @map("reference_type") @db.VarChar(50)
+
+  createdAt       DateTime          @default(now()) @map("created_at")
+
+  @@index([merchantId])
+  @@map("deposit_ledger")
+}
+
+// ---------------------------------------------------------------------------
+// 出金リクエスト
+//
+// 出金フロー:
+// 1. 加盟店が法定通貨での出金をリクエスト
+// 2. deposit_balance >= withdrawal_fee であることを検証（不足時は拒否）
+// 3. NOWPayments Fiat Payout API を呼び出し
+// 4. 結果を Webhook で受け取りステータス更新
+// ---------------------------------------------------------------------------
+
+enum PayoutStatus {
+  PENDING
+  APPROVED
+  PROCESSING
+  COMPLETED
+  REJECTED
+  FAILED
+}
+
+model PayoutRequest {
+  id                      String        @id @default(uuid()) @db.Uuid
+  merchantId              String        @map("merchant_id") @db.Uuid
+  merchant                Merchant      @relation(fields: [merchantId], references: [id])
+
+  /// 出金額（法定通貨）
+  amountFiat              Decimal       @map("amount_fiat") @db.Decimal(18, 2)
+
+  /// 出金時に徴収するシステム利用料
+  withdrawalFeeFiat       Decimal       @map("withdrawal_fee_fiat") @db.Decimal(18, 2)
+
+  /// NOWPayments 側の Payout ID
+  nowpaymentsPayoutId     String?       @unique @map("nowpayments_payout_id")
+
+  status                  PayoutStatus  @default(PENDING)
+
+  /// 拒否・失敗理由（例: DEPOSIT_INSUFFICIENT）
+  rejectionReason         String?       @map("rejection_reason")
+
+  createdAt               DateTime      @default(now()) @map("created_at")
+  updatedAt               DateTime      @updatedAt @map("updated_at")
+  completedAt             DateTime?     @map("completed_at")
+
+  @@index([merchantId])
+  @@index([status])
+  @@map("payout_requests")
+}
+
+// ---------------------------------------------------------------------------
+// Webhook イベントログ — 冪等処理のため、受信した全イベントを記録
+// ---------------------------------------------------------------------------
+
+model WebhookEvent {
+  id              String   @id @default(uuid()) @db.Uuid
+  provider        String   @db.VarChar(50) // "nowpayments"
+  eventId         String   @map("event_id") @db.VarChar(255)
+  payloadHash     String   @map("payload_hash") @db.VarChar(64)
+  processed       Boolean  @default(false)
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@unique([provider, eventId])
+  @@map("webhook_events")
+}

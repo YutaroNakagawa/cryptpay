@@ -1,0 +1,12 @@
+.env
+.env.*
+node_modules
+.next
+.git
+.gitignore
+Dockerfile
+.dockerignore
+docs
+*.md
+prisma
+supabase
